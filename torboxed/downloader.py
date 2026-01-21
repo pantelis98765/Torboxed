@@ -28,12 +28,15 @@ class DownloadWorker:
     def __init__(self) -> None:
         self.state = WorkerState(running=False)
         self._task: asyncio.Task | None = None
+        self._active_tasks: set[asyncio.Task] = set()
 
         # Rate limit: Torbox requests (submit/poll/etc)
-        self._torbox_limiter = AsyncLimiter(settings.torbox_rate_limit_per_minute, 60)
+        self._current_rate_limit = settings.torbox_rate_limit_per_minute
+        self._torbox_limiter = AsyncLimiter(self._current_rate_limit, 60)
 
         # Concurrency: local downloads
-        self._local_dl_sem = asyncio.Semaphore(max(1, settings.max_concurrent_local_downloads))
+        self._current_max_downloads = max(1, settings.max_concurrent_local_downloads)
+        self._local_dl_sem = asyncio.Semaphore(self._current_max_downloads)
 
         self._http = httpx.AsyncClient(timeout=300)
 
@@ -47,39 +50,106 @@ class DownloadWorker:
         self.state.running = False
         if self._task:
             await asyncio.wait([self._task], timeout=5)
+        # Wait for all active tasks to complete
+        if self._active_tasks:
+            await asyncio.wait(self._active_tasks, timeout=10)
         await self._http.aclose()
+
+    def _update_limiter(self) -> None:
+        """Update rate limiter from settings."""
+        with SessionLocal() as db:
+            rate_limit = self._get_setting(db, "torbox_rate_limit_per_minute")
+            if not rate_limit:
+                rate_limit = settings.torbox_rate_limit_per_minute
+            else:
+                try:
+                    rate_limit = int(rate_limit)
+                except ValueError:
+                    rate_limit = settings.torbox_rate_limit_per_minute
+            
+            if rate_limit > 0:
+                # Only update if value changed (avoid unnecessary recreation)
+                if not hasattr(self, '_current_rate_limit') or self._current_rate_limit != rate_limit:
+                    self._torbox_limiter = AsyncLimiter(rate_limit, 60)
+                    self._current_rate_limit = rate_limit
+
+    def _update_semaphore(self) -> None:
+        """Update download semaphore from settings."""
+        with SessionLocal() as db:
+            max_downloads = self._get_setting(db, "max_concurrent_local_downloads")
+            if not max_downloads:
+                max_downloads = settings.max_concurrent_local_downloads
+            else:
+                try:
+                    max_downloads = int(max_downloads)
+                except ValueError:
+                    max_downloads = settings.max_concurrent_local_downloads
+            
+            max_downloads = max(1, max_downloads)  # Ensure at least 1
+            
+            # Only update if value changed (avoid unnecessary recreation)
+            if not hasattr(self, '_current_max_downloads') or self._current_max_downloads != max_downloads:
+                self._local_dl_sem = asyncio.Semaphore(max_downloads)
+                self._current_max_downloads = max_downloads
 
     async def _run_loop(self) -> None:
         while self.state.running:
             # Periodically scan blackhole directory for new files to import
             await self._scan_blackhole()
-            await self._process_one()
+            
+            # Update limiters from settings (in case they changed)
+            self._update_limiter()
+            self._update_semaphore()
+            
+            # Clean up completed tasks
+            self._active_tasks = {t for t in self._active_tasks if not t.done()}
+            
+            # Start processing multiple items concurrently
+            # Get all queued/submitted items that aren't being processed
+            with SessionLocal() as db:
+                items = (
+                    db.query(Download)
+                    .filter(Download.status.in_(["queued", "submitted"]))
+                    .order_by(Download.id)
+                    .all()
+                )
+                
+                # Filter out items that are already being processed
+                processing_ids = set()
+                for task in self._active_tasks:
+                    if hasattr(task, '_download_id'):
+                        processing_ids.add(task._download_id)
+                
+                items_to_process = [item for item in items if item.id not in processing_ids]
+            
+            # Start tasks for items that need processing
+            for item in items_to_process:
+                # Move "queued" -> "submitting" before starting task
+                if item.status == "queued":
+                    with SessionLocal() as db:
+                        it = db.get(Download, item.id)
+                        if it and it.status == "queued":
+                            it.status = "submitting"
+                            db.add(it)
+                            db.commit()
+                
+                # Create task for this item
+                task = asyncio.create_task(self._process_item(item.id))
+                task._download_id = item.id  # Store ID for tracking
+                self._active_tasks.add(task)
+                # Don't await - let them run concurrently
+            
             await asyncio.sleep(0.5)
 
-    async def _process_one(self) -> None:
-        # Find next queued item
-        with SessionLocal() as db:
-            item: Download | None = (
-                db.query(Download).filter(Download.status.in_(["queued", "submitted"])).order_by(Download.id).first()
-            )
-            if not item:
-                return
-
-            # move "queued" -> "submitting"
-            if item.status == "queued":
-                item.status = "submitting"
-                db.add(item)
-                db.commit()
-                db.refresh(item)
-
-        # Work outside db session
+    async def _process_item(self, download_id: int) -> None:
+        """Process a single download item (submission and download)."""
         try:
-            await self._ensure_submitted(item.id)
-            await self._ensure_downloaded(item.id)
+            await self._ensure_submitted(download_id)
+            await self._ensure_downloaded(download_id)
         except Exception as e:  # noqa: BLE001
-            logger.exception("Worker failed processing download_id=%s", item.id)
+            logger.exception("Worker failed processing download_id=%s", download_id)
             with SessionLocal() as db:
-                it = db.get(Download, item.id)
+                it = db.get(Download, download_id)
                 if it and it.status not in ("completed", "cancelled"):
                     it.status = "failed"
                     it.error = f"{type(e).__name__}: {e}"
